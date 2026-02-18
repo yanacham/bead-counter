@@ -3,10 +3,14 @@ import cv2
 import numpy as np
 import base64
 import os
+import tempfile
+import shutil
 
 # --- グローバル変数 ---
 original_cv_image = None
-UPLOAD_DIR = "uploads"  # サーバー上の保存場所
+
+# RenderなどのLinux環境でも確実に書き込める場所(/tmp)を使う
+UPLOAD_DIR = tempfile.gettempdir()
 
 # --- 起動時の透明ダミー画像 ---
 TRANSPARENT_IMG = (
@@ -14,15 +18,17 @@ TRANSPARENT_IMG = (
 )
 
 def main(page: ft.Page):
-    page.title = "Bead Counter Pro Web"
+    page.title = "Bead Counter Web Fixed"
     page.window_width = 390
     page.window_height = 844
     page.bgcolor = "white"
     page.scroll = "auto"
 
-    # --- アップロード保存用フォルダを作成 ---
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    # --- アップロード先の設定 ---
+    # ここが重要！システムの一時フォルダを指定して書き込みエラーを防ぐ
     page.upload_dir = UPLOAD_DIR
+    
+    print(f"Saving files to: {UPLOAD_DIR}") # ログ確認用
 
     # --- OpenCV -> Base64 変換 ---
     def cv_to_base64(cv_img):
@@ -65,101 +71,134 @@ def main(page: ft.Page):
         result_text.value = "計算中..."
         result_text.update()
 
-        process_img = original_cv_image.copy()
+        try:
+            process_img = original_cv_image.copy()
 
-        # スライダー値取得
-        p_param2 = int(slider_sensitivity.value)
-        p_min_dist = int(slider_dist.value)
-        p_visual_r = int(slider_visual_r.value)
-        p_min_r = int(slider_min_r.value)
-        p_max_r = int(slider_max_r.value)
+            # スライダー値取得
+            p_param2 = int(slider_sensitivity.value)
+            p_min_dist = int(slider_dist.value)
+            p_visual_r = int(slider_visual_r.value)
+            p_min_r = int(slider_min_r.value)
+            p_max_r = int(slider_max_r.value)
 
-        # 処理
-        gray = cv2.cvtColor(process_img, cv2.COLOR_BGR2GRAY)
-        gray = cv2.medianBlur(gray, 5)
+            # 処理
+            gray = cv2.cvtColor(process_img, cv2.COLOR_BGR2GRAY)
+            gray = cv2.medianBlur(gray, 5)
 
-        circles = cv2.HoughCircles(
-            gray, 
-            cv2.HOUGH_GRADIENT, 
-            dp=1, 
-            minDist=max(1, p_min_dist),
-            param1=50, 
-            param2=max(1, p_param2),
-            minRadius=max(1, p_min_r),
-            maxRadius=max(1, p_max_r)
-        )
+            circles = cv2.HoughCircles(
+                gray, 
+                cv2.HOUGH_GRADIENT, 
+                dp=1, 
+                minDist=max(1, p_min_dist),
+                param1=50, 
+                param2=max(1, p_param2),
+                minRadius=max(1, p_min_r),
+                maxRadius=max(1, p_max_r)
+            )
 
-        detected_points = []
-        if circles is not None:
-            circles = np.uint16(np.around(circles))
-            for i in circles[0, :]:
-                detected_points.append([int(i[0]), int(i[1])])
+            detected_points = []
+            if circles is not None:
+                circles = np.uint16(np.around(circles))
+                for i in circles[0, :]:
+                    detected_points.append([int(i[0]), int(i[1])])
 
-        final_points = remove_overlaps(detected_points, p_visual_r)
+            final_points = remove_overlaps(detected_points, p_visual_r)
 
-        # 描画
-        for i, pt in enumerate(final_points):
-            cv2.circle(process_img, (pt[0], pt[1]), p_visual_r, (0, 255, 0), 2)
-            cv2.circle(process_img, (pt[0], pt[1]), 2, (0, 0, 255), -1)
-            text = str(i + 1)
-            font_scale = max(0.3, p_visual_r / 45.0)
-            (w, h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
-            cv2.putText(process_img, text, (pt[0]-w//2, pt[1]+h//2), 
-                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), 1, cv2.LINE_AA)
+            # 描画
+            for i, pt in enumerate(final_points):
+                cv2.circle(process_img, (pt[0], pt[1]), p_visual_r, (0, 255, 0), 2)
+                cv2.circle(process_img, (pt[0], pt[1]), 2, (0, 0, 255), -1)
+                text = str(i + 1)
+                font_scale = max(0.3, p_visual_r / 45.0)
+                (w, h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
+                cv2.putText(process_img, text, (pt[0]-w//2, pt[1]+h//2), 
+                            cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), 1, cv2.LINE_AA)
 
-        # 表示更新
-        img.src_base64 = cv_to_base64(process_img)
-        img.update()
+            # 表示更新
+            img.src_base64 = cv_to_base64(process_img)
+            img.update()
 
-        result_text.value = f"検出数: {len(final_points)} 個"
-        result_text.color = "red"
-        result_text.update()
+            result_text.value = f"検出数: {len(final_points)} 個"
+            result_text.color = "red"
+            result_text.update()
+        except Exception as err:
+            result_text.value = f"エラー: {err}"
+            result_text.update()
+            print(err)
 
-    # --- アップロード完了時の処理（ここが重要！） ---
+    # --- アップロード完了時の処理 ---
     def on_upload(e: ft.FilePickerUploadEvent):
         global original_cv_image
-        # 完了率1.0（100%）になったら処理開始
+        
+        # 1. 進捗を表示
+        result_text.value = f"受信中... {int(e.progress * 100)}%"
+        result_text.update()
+
+        # 2. 完了したら読み込み
         if e.progress >= 1.0:
+            result_text.value = "画像処理中..."
+            result_text.update()
+            
             file_name = e.file_name
-            # サーバー上のファイルパス
             server_path = os.path.join(UPLOAD_DIR, file_name)
             
-            # 日本語ファイル名対応の読み込み
+            print(f"Reading from: {server_path}") # ログ用
+
             try:
+                # ファイルが存在するか確認
+                if not os.path.exists(server_path):
+                    result_text.value = "エラー: ファイルが見つかりません"
+                    result_text.update()
+                    return
+
+                # OpenCVで読み込み
                 n = np.fromfile(server_path, np.uint8)
                 original_cv_image = cv2.imdecode(n, cv2.IMREAD_COLOR)
+
+                if original_cv_image is None:
+                    result_text.value = "エラー: 画像として開けませんでした"
+                    result_text.update()
+                    return
+
+                # まずはそのまま表示
+                img.src_base64 = cv_to_base64(original_cv_image)
+                img.update()
+                
+                result_text.value = "読み込み完了！カウント開始ボタンを押してください"
+                result_text.color = "blue"
+                result_text.update()
+
             except Exception as err:
-                result_text.value = "サーバーでの読み込みに失敗しました"
+                result_text.value = f"システムエラー: {err}"
                 result_text.update()
-                return
-
-            if original_cv_image is None:
-                result_text.value = "画像データが壊れているようです"
-                result_text.update()
-                return
-
-            # まずはそのまま表示
-            img.src_base64 = cv_to_base64(original_cv_image)
-            img.update()
-            
-            result_text.value = "受信完了！カウントボタンを押してください"
-            result_text.color = "blue"
-            result_text.update()
+                print(err)
 
     # --- ファイル選択時の処理 ---
     def on_result(e: ft.FilePickerResultEvent):
         if e.files:
-            # ここでサーバーへアップロードを開始する
-            result_text.value = "画像を送信中..."
+            result_text.value = "サーバーへ送信中..."
             result_text.update()
+            # 選択されたファイルをアップロード
             file_picker.upload(e.files)
+        else:
+            # キャンセルされた場合
+            result_text.value = "画像選択がキャンセルされました"
+            result_text.update()
 
-    # --- FilePickerの設定（アップロード対応） ---
+    # --- FilePickerの設定 ---
     file_picker = ft.FilePicker(
         on_result=on_result, 
         on_upload=on_upload
     )
     page.overlay.append(file_picker)
+
+    # --- ボタンのクリックイベント ---
+    def on_click_pick(e):
+        # ここで「画像ファイルのみ」を指定して開く（スマホ対策）
+        file_picker.pick_files(
+            allow_multiple=False,
+            file_type=ft.FilePickerFileType.IMAGE
+        )
 
     # スライダーイベント登録
     slider_sensitivity.on_change = run_detection
@@ -185,7 +224,7 @@ def main(page: ft.Page):
                         ft.ElevatedButton(
                             text="画像を選ぶ",
                             icon="camera_alt", 
-                            on_click=lambda _: file_picker.pick_files(),
+                            on_click=on_click_pick, # 関数を呼ぶ形に変更
                             bgcolor="blue", 
                             color="white"
                         ),
@@ -205,11 +244,11 @@ def main(page: ft.Page):
                 ft.ExpansionTile(
                     title=ft.Text("▼ 調整パネル"),
                     controls=[
-                        ft.Text("感度 (小さいほど検出しやすい)"),
+                        ft.Text("感度"),
                         slider_sensitivity,
-                        ft.Text("ビーズ間の距離"),
+                        ft.Text("距離"),
                         slider_dist,
-                        ft.Text("円の見た目サイズ"),
+                        ft.Text("サイズ"),
                         slider_visual_r,
                         ft.Text("最小半径"),
                         slider_min_r,
