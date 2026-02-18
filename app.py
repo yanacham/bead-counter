@@ -2,9 +2,11 @@ import flet as ft
 import cv2
 import numpy as np
 import base64
+import os
 
-# --- グローバル変数（元の画像を覚えておくため） ---
+# --- グローバル変数 ---
 original_cv_image = None
+UPLOAD_DIR = "uploads"  # サーバー上の保存場所
 
 # --- 起動時の透明ダミー画像 ---
 TRANSPARENT_IMG = (
@@ -12,30 +14,33 @@ TRANSPARENT_IMG = (
 )
 
 def main(page: ft.Page):
-    page.title = "Bead Counter Pro"
+    page.title = "Bead Counter Pro Web"
     page.window_width = 390
     page.window_height = 844
     page.bgcolor = "white"
     page.scroll = "auto"
 
-    # --- OpenCVの画像をFletで表示できるBase64文字に変換する関数 ---
+    # --- アップロード保存用フォルダを作成 ---
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    page.upload_dir = UPLOAD_DIR
+
+    # --- OpenCV -> Base64 変換 ---
     def cv_to_base64(cv_img):
         _, buffer = cv2.imencode(".png", cv_img)
         return base64.b64encode(buffer).decode("utf-8")
 
     # --- UIパーツ ---
-    # 画像パーツ（src_base64を使って直接データを流し込みます）
     img = ft.Image(src_base64=TRANSPARENT_IMG, width=300, height=400, fit=ft.ImageFit.CONTAIN)
     result_text = ft.Text("画像を選択してください", color="black", size=20, weight="bold")
 
-    # --- スライダーUI（初期値） ---
+    # --- スライダーUI ---
     slider_sensitivity = ft.Slider(min=10, max=60, divisions=50, value=15, label="感度: {value}")
     slider_dist = ft.Slider(min=10, max=100, divisions=90, value=15, label="距離: {value}")
     slider_visual_r = ft.Slider(min=5, max=50, divisions=45, value=20, label="見た目サイズ: {value}")
     slider_min_r = ft.Slider(min=5, max=50, divisions=45, value=10, label="最小半径: {value}")
     slider_max_r = ft.Slider(min=10, max=80, divisions=70, value=30, label="最大半径: {value}")
 
-    # --- 重なり除去ロジック ---
+    # --- 重なり除去 ---
     def remove_overlaps(points, radius):
         if not points: return []
         min_distance_sq = (radius * 1.8) ** 2
@@ -51,28 +56,25 @@ def main(page: ft.Page):
                 kept_points.append(pt)
         return kept_points
 
-    # --- メインの検出処理関数（スライダーを動かすたびに呼ばれる） ---
+    # --- 検出処理 ---
     def run_detection(e=None):
         global original_cv_image
-        
-        # 画像がまだ読み込まれていなければ何もしない
         if original_cv_image is None:
             return
 
         result_text.value = "計算中..."
         result_text.update()
 
-        # 1. 元の画像をコピーして使う（元の画像を汚さないため）
         process_img = original_cv_image.copy()
 
-        # 2. スライダーの値を取得
+        # スライダー値取得
         p_param2 = int(slider_sensitivity.value)
         p_min_dist = int(slider_dist.value)
         p_visual_r = int(slider_visual_r.value)
         p_min_r = int(slider_min_r.value)
         p_max_r = int(slider_max_r.value)
 
-        # 3. 画像処理（グレー化 -> Hough変換）
+        # 処理
         gray = cv2.cvtColor(process_img, cv2.COLOR_BGR2GRAY)
         gray = cv2.medianBlur(gray, 5)
 
@@ -93,55 +95,46 @@ def main(page: ft.Page):
             for i in circles[0, :]:
                 detected_points.append([int(i[0]), int(i[1])])
 
-        # 4. 重なり除去
         final_points = remove_overlaps(detected_points, p_visual_r)
 
-        # 5. 描画（コピーした画像に描く）
+        # 描画
         for i, pt in enumerate(final_points):
             cv2.circle(process_img, (pt[0], pt[1]), p_visual_r, (0, 255, 0), 2)
             cv2.circle(process_img, (pt[0], pt[1]), 2, (0, 0, 255), -1)
-            # 文字描画
             text = str(i + 1)
             font_scale = max(0.3, p_visual_r / 45.0)
             (w, h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
             cv2.putText(process_img, text, (pt[0]-w//2, pt[1]+h//2), 
                         cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), 1, cv2.LINE_AA)
 
-        # 6. 画像をBase64に変換して表示更新
-        new_base64 = cv_to_base64(process_img)
-        img.src_base64 = new_base64
+        # 表示更新
+        img.src_base64 = cv_to_base64(process_img)
         img.update()
 
-        # 7. テキスト更新
         result_text.value = f"検出数: {len(final_points)} 個"
         result_text.color = "red"
         result_text.update()
 
-    # --- スライダーにイベントを登録 ---
-    # on_change にすることで、ドラッグ中もリアルタイムに反応します
-    slider_sensitivity.on_change = run_detection
-    slider_dist.on_change = run_detection
-    slider_visual_r.on_change = run_detection
-    slider_min_r.on_change = run_detection
-    slider_max_r.on_change = run_detection
-
-    # --- ファイル選択時の処理 ---
-    def on_file_picked(e):
+    # --- アップロード完了時の処理（ここが重要！） ---
+    def on_upload(e: ft.FilePickerUploadEvent):
         global original_cv_image
-        if e.files:
-            file_path = e.files[0].path
+        # 完了率1.0（100%）になったら処理開始
+        if e.progress >= 1.0:
+            file_name = e.file_name
+            # サーバー上のファイルパス
+            server_path = os.path.join(UPLOAD_DIR, file_name)
             
-            # 日本語パス対策で numpy から読み込む
+            # 日本語ファイル名対応の読み込み
             try:
-                n = np.fromfile(file_path, np.uint8)
+                n = np.fromfile(server_path, np.uint8)
                 original_cv_image = cv2.imdecode(n, cv2.IMREAD_COLOR)
             except Exception as err:
-                result_text.value = "読み込みエラー"
+                result_text.value = "サーバーでの読み込みに失敗しました"
                 result_text.update()
                 return
 
             if original_cv_image is None:
-                result_text.value = "画像として開けませんでした"
+                result_text.value = "画像データが壊れているようです"
                 result_text.update()
                 return
 
@@ -149,20 +142,37 @@ def main(page: ft.Page):
             img.src_base64 = cv_to_base64(original_cv_image)
             img.update()
             
-            result_text.value = "準備OK！カウントボタンを押すか、スライダーを動かしてください"
+            result_text.value = "受信完了！カウントボタンを押してください"
             result_text.color = "blue"
             result_text.update()
 
-    # FilePicker設定
-    file_picker = ft.FilePicker()
-    file_picker.on_result = on_file_picked
+    # --- ファイル選択時の処理 ---
+    def on_result(e: ft.FilePickerResultEvent):
+        if e.files:
+            # ここでサーバーへアップロードを開始する
+            result_text.value = "画像を送信中..."
+            result_text.update()
+            file_picker.upload(e.files)
+
+    # --- FilePickerの設定（アップロード対応） ---
+    file_picker = ft.FilePicker(
+        on_result=on_result, 
+        on_upload=on_upload
+    )
     page.overlay.append(file_picker)
 
-    # --- 画面レイアウト ---
+    # スライダーイベント登録
+    slider_sensitivity.on_change = run_detection
+    slider_dist.on_change = run_detection
+    slider_visual_r.on_change = run_detection
+    slider_min_r.on_change = run_detection
+    slider_max_r.on_change = run_detection
+
+    # --- 画面構成 ---
     page.add(
         ft.Column(
             [
-                ft.Text("Bead Counter Pro", size=30, weight="bold", color="blue"),
+                ft.Text("Bead Counter Web", size=30, weight="bold", color="blue"),
                 
                 ft.Container(
                     content=img, 
@@ -180,8 +190,8 @@ def main(page: ft.Page):
                             color="white"
                         ),
                         ft.ElevatedButton(
-                            text="再計算",
-                            icon="refresh", 
+                            text="カウント開始",
+                            icon="calculate", 
                             on_click=run_detection,
                             bgcolor="green", 
                             color="white"
@@ -192,10 +202,8 @@ def main(page: ft.Page):
                 
                 result_text,
 
-                # 折りたたみ式の調整パネル
                 ft.ExpansionTile(
-                    title=ft.Text("▼ 調整パネル (リアルタイム反映)"),
-                    subtitle=ft.Text("スライダーを動かすと結果が変わります"),
+                    title=ft.Text("▼ 調整パネル"),
                     controls=[
                         ft.Text("感度 (小さいほど検出しやすい)"),
                         slider_sensitivity,
@@ -208,7 +216,7 @@ def main(page: ft.Page):
                         ft.Text("最大半径"),
                         slider_max_r,
                     ],
-                    initially_expanded=True # 最初から開いておく
+                    initially_expanded=False
                 )
             ],
             alignment="center",
